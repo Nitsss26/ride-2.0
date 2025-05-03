@@ -6,6 +6,7 @@ const WebSocket = require('ws');
 const { connectRedis, getRedisClient, getRedisSubscriber } = require('./redisClient');
 const { connectKafkaProducer, getKafkaProducer, connectKafkaConsumer, setupNotificationServiceConsumer } = require('./kafkaClient');
 const { getFetch } = require('./fetchHelper'); // Import getFetch from fetchHelper.js
+const { logError } = require('../utils/logger'); // Import logger
 
 const app = express();
 app.use(express.json());
@@ -14,13 +15,13 @@ const wss = new WebSocket.Server({ server });
 
 const RIDE_SERVICE_URL = process.env.RIDE_SERVICE_URL || 'http://localhost:3000';
 const DRIVER_SERVICE_URL = process.env.DRIVER_SERVICE_URL || 'http://localhost:3001';
+const SERVICE_NAME = 'notification-service';
 
 // Store WebSocket connections (use a Map for better performance)
-const clients = new Map(); // key: userId (riderId or driverId), value: WebSocket client
+const clients = new Map(); // key: userId (riderId or driverId), value: { ws: WebSocket client, subscriptions: Set<string> }
 
 // Store active ride offers and timeouts
-const activeOffers = new Map(); // key: rideId, value: { batch: [], currentDriverIndex: 0, timeoutId: null, offerTimeout: 120 }
-const rideTimeouts = new Map(); // key: rideId, value: timeoutId (for the overall 10-min ride timer check)
+const activeOffers = new Map(); // key: rideId, value: { batch: [], currentDriverIndex: 0, timeoutId: null, offerTimeout: 120, rideDetails: {} }
 
 let isRedisConnected = false;
 let isKafkaProducerConnected = false;
@@ -30,29 +31,36 @@ let isKafkaConsumerConnected = false;
 connectRedis().then(connected => {
     isRedisConnected = connected;
     if (connected) {
-        console.log('NotificationService Redis connected');
+        console.log('NotificationService Redis connected (Client & Subscriber)');
         monitorRedisKeys();
     } else {
         console.warn('NotificationService Redis connection failed. Real-time features may be limited.');
+        // Fallback to polling if Redis connection fails initially
+        setTimeout(pollRedisKeys, 5000);
     }
-}).catch(err => console.error('NotificationService Redis connection error:', err));
+}).catch(err => {
+    logError(SERVICE_NAME, err, 'Redis Connection');
+    setTimeout(pollRedisKeys, 5000); // Fallback polling on connection error
+});
+
 
 // --- Kafka Connection ---
 connectKafkaProducer().then(connected => {
     isKafkaProducerConnected = connected;
     if(connected) console.log('NotificationService Kafka Producer connected');
     else console.warn('NotificationService Kafka Producer connection failed. Critical events might not be published.');
-}).catch(err => console.error('NotificationService Kafka Producer connection error:', err));
+}).catch(err => logError(SERVICE_NAME, err, 'Kafka Producer Connection'));
 
 connectKafkaConsumer('notification-service-group').then(connected => {
     isKafkaConsumerConnected = connected;
     if (connected) {
         console.log('NotificationService Kafka Consumer connected');
+        // Pass handlers for Kafka message processing
         setupNotificationServiceConsumer({ handleDriverMatch, handleRideUpdate, handlePaymentCompleted });
     } else {
         console.warn('NotificationService Kafka Consumer connection failed. Will not process events.');
     }
-}).catch(err => console.error('NotificationService Kafka Consumer connection error:', err));
+}).catch(err => logError(SERVICE_NAME, err, 'Kafka Consumer Connection'));
 
 // --- WebSocket Handling ---
 wss.on('connection', (ws, req) => {
@@ -66,14 +74,15 @@ wss.on('connection', (ws, req) => {
     }
 
     console.log(`WebSocket client connected: ${userId}`);
-    clients.set(userId, ws);
+    // Store client and initialize subscriptions set
+    clients.set(userId, { ws: ws, subscriptions: new Set() });
 
     ws.send(JSON.stringify({ type: 'connection_ack', message: `Connected as ${userId}` }));
 
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            console.log(`Received WebSocket message from ${userId}:`, data);
+            // console.log(`Received WebSocket message from ${userId}:`, data); // Can be noisy
 
             switch (data.type) {
                 case 'driver_accept':
@@ -90,86 +99,88 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type' }));
             }
         } catch (error) {
-            console.error(`Failed to parse WebSocket message from ${userId} or handle it:`, error);
+            logError(SERVICE_NAME, error, `WS Message Parse/Handle Error from ${userId}`);
             ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
         }
     });
 
     ws.on('close', () => {
         console.log(`WebSocket client disconnected: ${userId}`);
+        unsubscribeClientFromAll(userId); // Unsubscribe from Redis Pub/Sub on disconnect
         clients.delete(userId);
-        // Clean up active offers for this driver
-        for (const [rideId, offer] of activeOffers.entries()) {
-            if (offer.batch[offer.currentDriverIndex]?.driverId === userId) {
-                clearTimeout(offer.timeoutId);
-                offer.currentDriverIndex++;
-                activeOffers.set(rideId, offer);
-                sendOfferToNextDriver(rideId);
-            }
-        }
+        // Clean up active offers for this driver if they disconnect abruptly
+        clearOfferForDisconnectedDriver(userId);
     });
 
     ws.on('error', (error) => {
-        console.error(`WebSocket error for client ${userId}:`, error);
+        logError(SERVICE_NAME, error, `WebSocket Error for ${userId}`);
+        unsubscribeClientFromAll(userId); // Clean up subscriptions on error
         clients.delete(userId);
+        clearOfferForDisconnectedDriver(userId);
     });
 });
 
+function clearOfferForDisconnectedDriver(driverId) {
+     // Clean up active offers if the disconnecting client was the currently offered driver
+     for (const [rideId, offer] of activeOffers.entries()) {
+        if (offer.batch[offer.currentDriverIndex]?.driverId === driverId) {
+            console.log(`Driver ${driverId} disconnected while being offered ride ${rideId}. Treating as rejection.`);
+            // Treat disconnect during offer as a rejection/timeout
+            handleDriverReject(driverId, rideId, 'Disconnected');
+            break; // Assume driver can only have one active offer at a time
+        }
+    }
+}
+
+
 // --- Notification Sending Function ---
 function sendNotification(userId, data) {
-    const client = clients.get(userId);
-    if (client && client.readyState === WebSocket.OPEN) {
+    const clientData = clients.get(userId);
+    if (clientData && clientData.ws && clientData.ws.readyState === WebSocket.OPEN) {
         try {
-            client.send(JSON.stringify(data));
-            console.log(`Sent notification to ${userId}: ${data.type}`);
+            clientData.ws.send(JSON.stringify(data));
+            // console.log(`Sent notification to ${userId}: ${data.type}`); // Can be noisy
             return true;
         } catch (error) {
-            console.error(`Failed to send notification to ${userId}:`, error);
+            logError(SERVICE_NAME, error, `WS Send Error to ${userId}`);
+            // Clean up broken connection
+            unsubscribeClientFromAll(userId);
             clients.delete(userId);
+            clearOfferForDisconnectedDriver(userId);
             return false;
         }
     } else {
-        console.log(`Client ${userId} not connected or not open. Cannot send notification.`);
-        if (client) clients.delete(userId);
+        // console.log(`Client ${userId} not connected or not open. Cannot send notification.`);
+        if (clientData) { // Clean up if entry exists but socket is not open
+             unsubscribeClientFromAll(userId);
+             clients.delete(userId);
+             clearOfferForDisconnectedDriver(userId);
+        }
         return false;
     }
 }
 
 // --- Kafka Message Handlers ---
-async function handleDriverMatch({ rideId, batch }) {
+async function handleDriverMatch({ rideId, batch, rideDetails }) {
+    if (!rideDetails) {
+        logError(SERVICE_NAME, new Error('Missing rideDetails in driver-match event'), `handleDriverMatch ${rideId}`);
+        console.warn(`Received driver match for ${rideId} without rideDetails. Cannot process.`);
+        return;
+    }
     console.log(`Received driver match batch for ride ${rideId}. Batch size: ${batch.length}`);
     if (!batch || batch.length === 0) {
-        console.log(`Empty batch received for ride ${rideId}. No offers to send.`);
+        console.log(`Empty batch received for ride ${rideId}. Publishing batch-expired.`);
+        // Let Driver Service know the batch was empty/invalid
+        publishKafkaEvent('batch-expired', rideId, { rideId: rideId, reason: 'Empty or invalid batch received' })
+            .catch(e => logError(SERVICE_NAME, e, 'Kafka Publish batch-expired (empty)'));
         return;
     }
 
-    // Check if the driver is already assigned to another ride
-    for (const driverInfo of batch) {
-        const driverId = driverInfo.driverId;
-        try {
-            const fetch = await getFetch(); // Get fetch dynamically
-            const response = await fetch(`${DRIVER_SERVICE_URL}/drivers/${driverId}`);
-            if (response.ok) {
-                const driverData = await response.json();
-                if (driverData.currentStatus !== 'available') {
-                    console.log(`Driver ${driverId} is not available (status: ${driverData.currentStatus}). Skipping.`);
-                    batch.splice(batch.indexOf(driverInfo), 1);
-                }
-            }
-        } catch (error) {
-            console.error(`Failed to check driver ${driverId} status:`, error);
-        }
-    }
-
-    if (batch.length === 0) {
-        console.log(`No available drivers in batch for ride ${rideId}. Publishing batch-expired.`);
-        publishKafkaEvent('batch-expired', rideId, { rideId: rideId, reason: 'No available drivers' });
-        return;
-    }
-
-    clearTimeout(activeOffers.get(rideId)?.timeoutId);
+    // Store the batch and ride details, then start the offer process
+    clearTimeout(activeOffers.get(rideId)?.timeoutId); // Clear previous offer timeout if any
     activeOffers.set(rideId, {
         batch: batch,
+        rideDetails: rideDetails, // Store ride details associated with this batch
         currentDriverIndex: 0,
         offerTimeout: parseInt(process.env.DRIVER_OFFER_TIMEOUT_SECONDS || '30'),
         timeoutId: null
@@ -179,64 +190,79 @@ async function handleDriverMatch({ rideId, batch }) {
 }
 
 
-async function handleRideUpdate({ rideId, status, riderId, driverId }) {
+async function handleRideUpdate({ rideId, status, riderId, driverId, vehicleDetails, message, otp }) {
     console.log(`Received ride update via Kafka for ride ${rideId}: Status ${status}`);
-    if (status === 'cancelled_by_rider' || status === 'cancelled_by_driver' || status === 'timed-out') {
+    const finalStates = ['completed', 'cancelled_by_rider', 'cancelled_by_driver', 'timed-out'];
+
+    // Clean up active offer state if ride is finalized
+    if (finalStates.includes(status)) {
         const offer = activeOffers.get(rideId);
         if (offer) {
             clearTimeout(offer.timeoutId);
             activeOffers.delete(rideId);
-            console.log(`Cleared active offer for ${status} ride ${rideId}`);
+            console.log(`Cleared active offer for finalized ride ${rideId} (Status: ${status})`);
         }
-        if (status === 'cancelled_by_rider' && driverId) {
-            sendNotification(driverId, { type: 'ride_cancelled', rideId, reason: 'Cancelled by rider' });
-        } else if (status === 'cancelled_by_driver' && riderId) {
-            sendNotification(riderId, { type: 'ride_cancelled', rideId, reason: 'Cancelled by driver' });
-       } else if (status === 'timed-out' && riderId) {
-            sendNotification(riderId, { type: 'ride_timed_out', rideId, message: 'Could not find a driver in time.' });
+         // Unsubscribe rider if they were subscribed
+         if (riderId && driverId) {
+            unsubscribeRiderFromLocation(riderId, driverId);
         }
-    } else if (status === 'driver_assigned' && riderId && driverId) {
-        console.log(`Notifying rider ${riderId} about driver ${driverId} assignment for ride ${rideId}`);
-        sendNotification(riderId, {
-            type: 'driver_assigned',
-            rideId: rideId,
-            driverId: driverId,
-            message: `Driver ${driverId.slice(-4)} is on the way!`,
-        });
-        subscribeRiderToLocation(riderId, driverId);
-    } else if (status === 'driver_arrived' && riderId && driverId) {
-        console.log(`Notifying rider ${riderId} that driver ${driverId} has arrived for ride ${rideId}`);
-        const simulatedOtp = "123456";
-        sendNotification(riderId, {
-            type: 'driver_arrived',
-            rideId: rideId,
-           message: `Your driver has arrived! Share this OTP with the driver: ${simulatedOtp}`,
-            otp: simulatedOtp
-       });
-        sendNotification(driverId, { type: 'arrival_confirmed', rideId });
-   } else if (status === 'in-progress' && riderId && driverId) {
-        console.log(`Notifying rider ${riderId} and driver ${driverId} that ride ${rideId} is in progress`);
-        sendNotification(riderId, { type: 'ride_started', rideId, message: 'Your ride has started!' });
-        sendNotification(driverId, { type: 'ride_started', rideId, message: 'Ride is now in progress.' });
+    }
+
+    // Prepare notification data
+    const notificationData = {
+        type: `ride_${status}`, // e.g., ride_driver_assigned
+        rideId: rideId,
+        message: message || `Ride status updated to ${status}.`, // Use message from event if available
+         ...(driverId && { driverId }), // Include IDs if present
+         ...(riderId && { riderId }),
+         ...(vehicleDetails && { vehicleDetails }),
+         ...(otp && { otp }) // Include OTP if provided (for driver_arrived)
+    };
+
+    // Send notifications based on status
+    switch (status) {
+        case 'driver_assigned':
+            if (riderId) sendNotification(riderId, notificationData);
+            // Notification Service already notified the driver who accepted.
+            // Start location sharing
+            if (riderId && driverId) subscribeRiderToLocation(riderId, driverId);
+            break;
+        case 'driver_arrived':
+            if (riderId) sendNotification(riderId, notificationData); // Send OTP to rider
+            if (driverId) sendNotification(driverId, { type: 'arrival_confirmed', rideId }); // Confirm arrival to driver
+            break;
+        case 'in-progress':
+            if (riderId) sendNotification(riderId, { ...notificationData, type: 'ride_started', message: 'Your ride has started!' });
+            if (driverId) sendNotification(driverId, { ...notificationData, type: 'ride_started', message: 'Ride is now in progress.' });
+            break;
+        case 'cancelled_by_rider':
+             if (driverId) sendNotification(driverId, { ...notificationData, message: 'Ride cancelled by rider.' }); // Notify potentially assigned driver
+             break;
+         case 'cancelled_by_driver':
+             if (riderId) sendNotification(riderId, { ...notificationData, message: 'Ride cancelled by driver.' }); // Notify rider
+             break;
+        case 'timed-out':
+            if (riderId) sendNotification(riderId, { ...notificationData, message: 'Could not find a driver in time. Please try again.' });
+            break;
+        // No explicit notification needed for 'completed' here, handled by handlePaymentCompleted
+        default:
+             console.log(`No specific notification logic for ride status: ${status}`);
     }
 }
 
 async function handlePaymentCompleted({ rideId, riderId, driverId, fare }) {
     console.log(`Received payment completion via Kafka for ride ${rideId}`);
-    sendNotification(riderId, {
+    const notificationData = {
         type: 'ride_completed',
         rideId: rideId,
-        message: `Your ride is complete. Thank you! Fare: ${fare?.amount || 'N/A'} ${fare?.currency || ''}`,
+        message: `Your ride is complete. Thank you!`,
         fare: fare
-    });
+    };
+    if (riderId) sendNotification(riderId, notificationData);
     if (driverId) {
-        sendNotification(driverId, {
-            type: 'ride_completed',
-            rideId: rideId,
-            message: `Ride complete. Payment received. You are now available.`,
-            fare: fare
-        });
-        unsubscribeRiderFromLocation(riderId, driverId);
+         sendNotification(driverId, { ...notificationData, message: 'Ride complete. Payment received. You are now available.' });
+          // Unsubscribe rider from driver's location
+          unsubscribeRiderFromLocation(riderId, driverId);
     }
 }
 
@@ -251,21 +277,23 @@ function sendOfferToNextDriver(rideId) {
     if (offer.currentDriverIndex >= offer.batch.length) {
         console.log(`Batch exhausted for ride ${rideId}.`);
         activeOffers.delete(rideId);
-        publishKafkaEvent('batch-expired', rideId, { rideId: rideId, reason: 'Batch exhausted' });
+        publishKafkaEvent('batch-expired', rideId, { rideId: rideId, reason: 'Batch exhausted' })
+            .catch(e => logError(SERVICE_NAME, e, 'Kafka Publish batch-exhausted'));
         return;
     }
 
     const driverInfo = offer.batch[offer.currentDriverIndex];
     const driverId = driverInfo.driverId;
+    const rideDetails = offer.rideDetails; // Get associated ride details
 
     console.log(`Sending offer for ride ${rideId} to driver ${driverId} (Index: ${offer.currentDriverIndex})`);
 
     const offerSent = sendNotification(driverId, {
         type: 'ride_offer',
         rideId: rideId,
-        pickupLocation: offer.batch[0]?.rideDetails?.pickupLocation,
-        dropoffLocation: offer.batch[0]?.rideDetails?.dropoffLocation,
-        estimatedFare: offer.batch[0]?.rideDetails?.fare,
+        pickupLocation: rideDetails?.pickupLocation, // Use rideDetails from the offer map
+        dropoffLocation: rideDetails?.dropoffLocation,
+        estimatedFare: rideDetails?.fare, // Add fare if available in rideDetails
         timeout: offer.offerTimeout
     });
 
@@ -277,6 +305,7 @@ function sendOfferToNextDriver(rideId) {
         activeOffers.set(rideId, offer);
     } else {
         console.warn(`Failed to send offer to driver ${driverId}. Trying next.`);
+        // Treat failure to send as an immediate rejection/timeout
         handleDriverReject(driverId, rideId, 'Failed to contact');
     }
 }
@@ -293,15 +322,24 @@ function handleDriverAccept(driverId, rideId) {
 
     clearTimeout(offer.timeoutId);
 
-    updateDriverStatus(driverId, 'en_route_pickup', rideId);
-    const acceptedDriverInfo = offer.batch[offer.currentDriverIndex];
-    publishRideUpdate(rideId, {
-        status: 'driver_assigned',
-        driverId: driverId,
-        vehicleDetails: acceptedDriverInfo.vehicle
-    });
+    // 1. Update Driver Status -> Let Driver Service handle this via Kafka event
+    // updateDriverStatus(driverId, 'en_route_pickup', rideId); // Removed direct call
 
+    // 2. Publish 'driver_accepted' event. Ride/Driver services react to this.
+    const acceptedDriverInfo = offer.batch[offer.currentDriverIndex];
+    publishKafkaEvent('driver-actions', rideId, { // Use a new topic 'driver-actions'
+         type: 'driver_accepted',
+         rideId: rideId,
+         driverId: driverId,
+         vehicleDetails: acceptedDriverInfo?.vehicle, // Send vehicle details
+         timestamp: new Date().toISOString()
+     }).catch(e => logError(SERVICE_NAME, e, 'Kafka Publish driver_accepted'));
+
+
+    // 3. Confirm acceptance to the driver via WebSocket
     sendNotification(driverId, { type: 'offer_accepted', rideId, message: 'Offer accepted. Proceed to pickup.' });
+
+    // 4. Clean up the active offer state for this ride
     activeOffers.delete(rideId);
 }
 
@@ -310,36 +348,47 @@ function handleDriverReject(driverId, rideId, reason = 'Rejected') {
     const offer = activeOffers.get(rideId);
 
     if (!offer) {
+        // Offer might have been accepted by someone else or timed out already
         console.warn(`Received rejection/timeout from driver ${driverId} for ride ${rideId}, but no active offer found.`);
         return;
     }
 
-    if (offer.batch[offer.currentDriverIndex]?.driverId === driverId) {
+     // Check if the rejection is from the currently offered driver
+     if (offer.batch[offer.currentDriverIndex]?.driverId === driverId) {
         clearTimeout(offer.timeoutId);
         offer.timeoutId = null;
+
+        // Publish 'driver_rejected' event (optional, but good for analytics)
+        publishKafkaEvent('driver-actions', rideId, {
+             type: 'driver_rejected',
+             rideId: rideId,
+             driverId: driverId,
+             reason: reason,
+             timestamp: new Date().toISOString()
+         }).catch(e => logError(SERVICE_NAME, e, 'Kafka Publish driver_rejected'));
+
+        // Move to the next driver
         offer.currentDriverIndex++;
         activeOffers.set(rideId, offer);
         sendOfferToNextDriver(rideId);
-    } else {
-        console.warn(`Received rejection from driver ${driverId} but they are not the current driver offered for ride ${rideId}. Ignoring.`);
-    }
+     } else {
+         console.warn(`Received rejection from driver ${driverId} but they are not the current driver offered for ride ${rideId}. Ignoring.`);
+     }
 }
 
 // --- Redis Key Monitoring ---
 async function monitorRedisKeys() {
-    if (!isRedisConnected) return;
-    console.log("Starting Redis key monitoring...");
+    const subscriber = getRedisSubscriber(); // Use the dedicated subscriber client
+    if (!subscriber || !isRedisConnected) {
+         console.warn("Redis subscriber client not available or not connected. Falling back to polling Redis keys.");
+         setTimeout(pollRedisKeys, 5000); // Start polling as fallback
+         return;
+     }
+    console.log("Attempting to subscribe to Redis keyspace events...");
 
     try {
-        const subscriber = getRedisSubscriber();
-        if (!subscriber) {
-            console.warn("Redis subscriber client not available for keyspace notifications.");
-            setTimeout(pollRedisKeys, 5000);
-            return;
-        }
-
         await subscriber.subscribe('__keyevent@0__:expired', (message, channel) => {
-            console.log(`Redis Keyspace Event: ${channel} -> Key: ${message}`);
+            // console.log(`Redis Keyspace Event: ${channel} -> Key: ${message}`); // Can be noisy
             if (message.startsWith('ride-timer:')) {
                 const rideId = message.split(':')[1];
                 handleRideTimeout(rideId);
@@ -348,48 +397,73 @@ async function monitorRedisKeys() {
                 handleBatchTimeout(rideId);
             }
         });
-        console.log("Subscribed to Redis keyspace expired events.");
-
+        console.log("Successfully subscribed to Redis keyspace expired events.");
     } catch (error) {
-        console.error("Error subscribing to Redis keyspace events:", error);
-        console.log("Falling back to polling Redis keys due to subscription error.");
-        setTimeout(pollRedisKeys, 5000);
+        logError(SERVICE_NAME, error, "Redis Keyspace Subscription Failed");
+        console.error("Error subscribing to Redis keyspace events. Falling back to polling.");
+        // Unsubscribe might be needed if partially subscribed before error
+        try { await subscriber.unsubscribe('__keyevent@0__:expired'); } catch (unsubError) {/* ignore */}
+        setTimeout(pollRedisKeys, 5000); // Fallback to polling
     }
 }
 
+// Fallback Polling Function
+let pollTimeoutId = null;
 async function pollRedisKeys() {
+    clearTimeout(pollTimeoutId); // Clear previous timeout if exists
     if (!isRedisConnected) {
         console.warn("Polling stopped: Redis not connected.");
+        // Attempt to reconnect Redis? Or just wait?
+        // Let's retry polling after a delay
+        pollTimeoutId = setTimeout(pollRedisKeys, 15000); // Retry polling after 15s
         return;
     }
     const redisClient = getRedisClient();
-    if (!redisClient) return;
+    if (!redisClient) {
+         pollTimeoutId = setTimeout(pollRedisKeys, 15000); // Retry polling after 15s
+         return;
+    }
 
     try {
-        const rideTimerKeys = await redisClient.keys('ride-timer:*');
-        for (const key of rideTimerKeys) {
-            const ttl = await redisClient.ttl(key);
-            if (ttl <= 0) {
-                const rideId = key.split(':')[1];
-                handleRideTimeout(rideId);
-                await redisClient.del(key);
+        // Use SCAN instead of KEYS for better performance in production
+        let cursor = '0';
+        do {
+            const reply = await redisClient.scan(cursor, { MATCH: 'ride-timer:*', COUNT: 100 });
+            cursor = reply.cursor;
+            const keys = reply.keys;
+            for (const key of keys) {
+                try {
+                     const ttl = await redisClient.ttl(key);
+                     if (ttl === -2) { // Key expired / doesn't exist
+                         const rideId = key.split(':')[1];
+                         handleRideTimeout(rideId);
+                         // No need to DEL, TTL handles it.
+                     }
+                } catch(keyError) { logError(SERVICE_NAME, keyError, `Polling TTL check failed for key ${key}`); }
             }
-        }
+        } while (cursor !== '0');
 
-        const batchKeys = await redisClient.keys('driver-batch:*');
-        for (const key of batchKeys) {
-            const ttl = await redisClient.ttl(key);
-            if (ttl <= 0) {
-                const rideId = key.split(':')[1];
-                handleBatchTimeout(rideId);
-                await redisClient.del(key);
-            }
-        }
+        cursor = '0';
+         do {
+             const reply = await redisClient.scan(cursor, { MATCH: 'driver-batch:*', COUNT: 100 });
+             cursor = reply.cursor;
+             const keys = reply.keys;
+             for (const key of keys) {
+                  try {
+                      const ttl = await redisClient.ttl(key);
+                      if (ttl === -2) {
+                          const rideId = key.split(':')[1];
+                          handleBatchTimeout(rideId);
+                      }
+                  } catch(keyError) { logError(SERVICE_NAME, keyError, `Polling TTL check failed for key ${key}`); }
+             }
+         } while (cursor !== '0');
 
     } catch (error) {
-        console.error("Error polling Redis keys:", error);
+        logError(SERVICE_NAME, error, "Polling Redis Keys Error");
     } finally {
-        setTimeout(pollRedisKeys, 5000);
+        // Schedule next poll
+        pollTimeoutId = setTimeout(pollRedisKeys, 5000); // Poll again in 5 seconds
     }
 }
 
@@ -401,7 +475,9 @@ function handleRideTimeout(rideId) {
         activeOffers.delete(rideId);
         console.log(`Cleared active offer due to ride timeout for ride ${rideId}`);
     }
-    publishRideUpdate(rideId, { status: 'timed-out', reason: '10 minute limit reached' });
+    // Publish ride-timeout event via Kafka -> Ride Service consumes this
+    publishKafkaEvent('ride-updates', rideId, { rideId, status: 'timed-out', reason: '10 minute limit reached', timestamp: new Date().toISOString() })
+        .catch(e => logError(SERVICE_NAME, e, 'Kafka Publish ride-timed-out'));
 }
 
 function handleBatchTimeout(rideId) {
@@ -409,140 +485,165 @@ function handleBatchTimeout(rideId) {
     const offer = activeOffers.get(rideId);
     if (offer) {
         console.log(`Batch timed out, but an offer is still active for ride ${rideId}. Allowing driver response timeout to handle.`);
+        // Let the driver_reject timeout handle the progression
     } else {
-        console.log(`No active offer for ride ${rideId} upon batch expiry. Publishing batch-expired event.`);
-        publishKafkaEvent('batch-expired', rideId, { rideId: rideId, reason: 'Batch TTL expired' });
+         // If no offer is active (all drivers rejected/timed out or batch was invalid)
+         console.log(`No active offer for ride ${rideId} upon batch expiry. Publishing batch-expired event.`);
+         publishKafkaEvent('batch-expired', rideId, { rideId: rideId, reason: 'Batch TTL expired' })
+            .catch(e => logError(SERVICE_NAME, e, 'Kafka Publish batch-expired (TTL)'));
     }
 }
 
 // --- Location Subscription ---
 async function subscribeRiderToLocation(riderId, driverId) {
-    if (!isRedisConnected) {
-        console.warn(`Cannot subscribe rider ${riderId} to location updates: Redis not connected.`);
-        return;
-    }
     const subscriber = getRedisSubscriber();
-    if (!subscriber) {
-        console.warn(`Cannot subscribe rider ${riderId}: Redis subscriber not available.`);
+    if (!subscriber || !isRedisConnected) {
+        console.warn(`Cannot subscribe rider ${riderId} to location updates: Redis subscriber not available or not connected.`);
         return;
     }
 
     const channel = `driver-location-updates:${driverId}`;
+    const clientData = clients.get(riderId);
+
+    if (!clientData || !clientData.ws || clientData.ws.readyState !== WebSocket.OPEN) {
+        console.log(`Rider ${riderId} not connected. Cannot subscribe to location updates for driver ${driverId}.`);
+        return;
+    }
+    if (clientData.subscriptions.has(channel)) {
+        // console.log(`Rider ${riderId} already subscribed to ${channel}`);
+        return; // Already subscribed
+    }
+
     try {
-        const riderClient = clients.get(riderId);
-        if (!riderClient || riderClient.readyState !== WebSocket.OPEN) {
-            console.log(`Rider ${riderId} not connected. Cannot subscribe to location updates.`);
-            return;
-        }
+        // Define message handler specific to this subscription & client
+         const messageHandler = (message, msgChannel) => {
+              if (msgChannel === channel) {
+                  const currentClientData = clients.get(riderId); // Re-check client exists before sending
+                  if (currentClientData && currentClientData.ws.readyState === WebSocket.OPEN) {
+                      try {
+                          const locationData = JSON.parse(message);
+                          sendNotification(riderId, { // Use sendNotification for safety
+                              type: 'driver_location_update',
+                              rideId: locationData.rideId,
+                              driverId: driverId,
+                              location: locationData.location
+                          });
+                      } catch (e) {
+                          logError(SERVICE_NAME, e, `Error parsing/sending location update for rider ${riderId} from channel ${channel}`);
+                      }
+                  } else {
+                       // If client disconnected while subscribed, attempt cleanup (though close handler should also catch this)
+                       console.warn(`Client ${riderId} disconnected, but received message on ${channel}. Attempting unsubscribe.`);
+                       unsubscribeRiderFromLocation(riderId, driverId);
+                  }
+              }
+          };
 
-        if (!riderClient.subscriptions) riderClient.subscriptions = new Set();
-        if (riderClient.subscriptions.has(channel)) {
-            console.log(`Rider ${riderId} already subscribed to ${channel}`);
-            return;
-        }
-
-        const messageHandler = (message, msgChannel) => {
-            if (msgChannel === channel) {
-                try {
-                    const locationData = JSON.parse(message);
-                    sendNotification(riderId, {
-                        type: 'driver_location_update',
-                        rideId: locationData.rideId,
-                        driverId: driverId,
-                        location: locationData.location
-                    });
-                } catch (e) {
-                    console.error(`Error parsing location update for rider ${riderId} from channel ${channel}:`, e);
-                }
-            }
-        };
+        // Associate handler with the client for potential removal later
+        clientData.locationHandler = messageHandler;
 
         await subscriber.subscribe(channel, messageHandler);
-        riderClient.subscriptions.add(channel);
+        clientData.subscriptions.add(channel);
         console.log(`Rider ${riderId} subscribed to location updates for driver ${driverId} on channel ${channel}`);
 
     } catch (error) {
-        console.error(`Error subscribing rider ${riderId} to channel ${channel}:`, error);
+        logError(SERVICE_NAME, error, `Error subscribing rider ${riderId} to channel ${channel}`);
     }
 }
 
 async function unsubscribeRiderFromLocation(riderId, driverId) {
-    if (!isRedisConnected) return;
     const subscriber = getRedisSubscriber();
-    if (!subscriber) return;
+    if (!subscriber || !isRedisConnected) return;
 
     const channel = `driver-location-updates:${driverId}`;
-    const riderClient = clients.get(riderId);
+    const clientData = clients.get(riderId);
 
     try {
-        await subscriber.unsubscribe(channel);
-        if (riderClient && riderClient.subscriptions) {
-            riderClient.subscriptions.delete(channel);
-        }
-        console.log(`Rider ${riderId} unsubscribed from location updates for driver ${driverId} on channel ${channel}`);
+         // Use pUnsubscribe or unsubscribe based on how you subscribed initially
+         // If using individual handlers per client, managing unsubscription becomes complex.
+         // A simpler approach for this service might be to have ONE handler for the channel
+         // that then looks up the rider WS based on the driverId->rideId->riderId mapping,
+         // but that requires more state management here.
+         // Current approach: We just remove the subscription tracking from the clientData.
+         // The actual Redis subscription might persist until the subscriber client restarts,
+         // but the handler checks if the client is still valid.
+
+         if (clientData && clientData.subscriptions.has(channel)) {
+            // Optional: If you associated the handler: subscriber.unsubscribe(channel, clientData.locationHandler);
+            await subscriber.unsubscribe(channel); // General unsubscribe from channel if using shared handler
+            clientData.subscriptions.delete(channel);
+            delete clientData.locationHandler; // Remove handler reference
+            console.log(`Rider ${riderId} unsubscribed from location updates for driver ${driverId} on channel ${channel}`);
+         }
     } catch (error) {
-        console.error(`Error unsubscribing rider ${riderId} from channel ${channel}:`, error);
+        logError(SERVICE_NAME, error, `Error unsubscribing rider ${riderId} from channel ${channel}`);
     }
 }
 
+// Unsubscribe a client from all their Redis subscriptions
+async function unsubscribeClientFromAll(userId) {
+    const clientData = clients.get(userId);
+    if (clientData && clientData.subscriptions && clientData.subscriptions.size > 0) {
+        const subscriber = getRedisSubscriber();
+        if (subscriber && isRedisConnected) {
+            console.log(`Unsubscribing client ${userId} from channels:`, Array.from(clientData.subscriptions));
+             try {
+                 // Unsubscribe from all tracked channels for this client
+                 // Note: This might unsubscribe other clients if using a shared handler per channel.
+                 // A more robust approach might involve reference counting per channel.
+                 await subscriber.unsubscribe(Array.from(clientData.subscriptions));
+             } catch (error) {
+                  logError(SERVICE_NAME, error, `Error unsubscribing client ${userId} from channels`);
+             }
+        }
+        clientData.subscriptions.clear(); // Clear tracked subscriptions regardless
+    }
+}
+
+
 // --- Helper Functions for Cross-Service Communication ---
 async function publishKafkaEvent(topic, key, data) {
-    if (!isKafkaProducerConnected) {
+    const producer = getKafkaProducer();
+    if (!producer) {
         console.warn(`Kafka Producer not connected. Cannot publish ${topic} event for key ${key}.`);
-        return;
+        return; // Don't proceed without Kafka for critical events
     }
     try {
-        const producer = getKafkaProducer();
         await producer.send({
             topic: topic,
             messages: [{ key: key, value: JSON.stringify(data) }],
         });
-        console.log(`Published ${topic} event for key ${key}:`, data);
+        // console.log(`Published ${topic} event for key ${key}`); // Can be noisy
     } catch (error) {
-        console.error(`Failed to publish ${topic} event for key ${key}:`, error);
+        logError(SERVICE_NAME, error, `Kafka Publish Failed - Topic: ${topic}, Key: ${key}`);
     }
 }
 
-async function updateDriverStatus(driverId, status, rideId = null) {
-    console.log(`Requesting status update for driver ${driverId} to ${status}` + (rideId ? ` (Ride: ${rideId})` : ''));
-    try {
-        const fetch = await getFetch(); // Get fetch dynamically
-        const response = await fetch(`${DRIVER_SERVICE_URL}/drivers/${driverId}/status`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ status, rideId }),
-        });
-        if (!response.ok) {
-            throw new Error(`Driver Service returned status ${response.status}`);
-        }
-        console.log(`Successfully requested status update for driver ${driverId}`);
-    } catch (error) {
-        console.error(`Error updating driver ${driverId} status via Driver Service:`, error.message);
-    }
-}
+// Removed direct call to updateDriverStatus - rely on Kafka events
 
 async function publishRideUpdate(rideId, updateData) {
-    console.log(`Publishing ride update for ${rideId}:`, updateData);
-    await publishKafkaEvent('ride-updates', rideId, { rideId, ...updateData });
+    // Helper specifically for publishing to 'ride-updates' topic
+    await publishKafkaEvent('ride-updates', rideId, { rideId, ...updateData, timestamp: new Date().toISOString() });
 }
 
-// --- API Endpoints ---
-app.post('/notify/rider/:riderId', (req, res) => {
-    const { riderId } = req.params;
+
+// --- API Endpoints (for direct notification simulation/testing - Keep for testing) ---
+app.post('/notify/user/:userId', (req, res) => { // Renamed from /rider/
+    const { userId } = req.params;
     const notificationData = req.body;
-    console.log(`Received direct notification request for rider ${riderId}`);
-    const success = sendNotification(riderId, notificationData);
+    console.log(`Received direct notification request for user ${userId}`);
+    const success = sendNotification(userId, notificationData);
     if (success) {
         res.status(200).json({ message: 'Notification sent' });
     } else {
-        res.status(404).json({ message: 'Rider not connected' });
+        res.status(404).json({ message: 'User not connected' });
     }
 });
 
-app.post('/notify/driver/:driverId', (req, res) => {
+app.post('/notify/driver/:driverId', (req, res) => { // Keep specific driver endpoint if needed
     const { driverId } = req.params;
     const notificationData = req.body;
-    console.log(`Received direct notification request for driver ${driverId}`);
+     console.log(`Received direct notification request for driver ${driverId}`);
     const success = sendNotification(driverId, notificationData);
     if (success) {
         res.status(200).json({ message: 'Notification sent' });
@@ -551,14 +652,33 @@ app.post('/notify/driver/:driverId', (req, res) => {
     }
 });
 
+// Endpoint to simulate receiving a batch (for testing without Kafka)
 app.post('/notify/drivers', (req, res) => {
-    const { rideId, batch } = req.body;
-    console.log(`Received direct batch notification request for ride ${rideId}`);
-    if (!rideId || !batch) {
-        return res.status(400).json({ message: 'Missing rideId or batch' });
-    }
-    handleDriverMatch({ rideId, batch });
-    res.status(200).json({ message: 'Batch processing initiated' });
+     const { rideId, batch, rideDetails } = req.body; // Expect rideDetails now
+     console.log(`Received direct batch notification request for ride ${rideId}`);
+     if (!rideId || !batch || !rideDetails) {
+         return res.status(400).json({ message: 'Missing rideId, batch, or rideDetails' });
+     }
+     // Manually call the handler function
+     handleDriverMatch({ rideId, batch, rideDetails });
+     res.status(200).json({ message: 'Batch processing initiated' });
+ });
+
+ // Endpoint to notify a group (e.g., support alerts) - Simple broadcast for now
+ app.post('/notify/group/:groupId', (req, res) => {
+    const { groupId } = req.params;
+    const notificationData = req.body;
+    console.log(`Received notification request for group ${groupId}`);
+    let count = 0;
+    // In a real system, you'd look up members of the group
+    // Here, we just broadcast to all connected clients for demo (use with caution!)
+    clients.forEach((clientData, userId) => {
+       // Add logic here to filter by group if possible (e.g., based on user role)
+       if (sendNotification(userId, notificationData)) {
+           count++;
+       }
+    });
+    res.status(200).json({ message: `Broadcast attempt to group ${groupId} (Sent to ${count} clients).` });
 });
 
 // --- Health Check ---
@@ -576,4 +696,11 @@ app.get('/health', (req, res) => {
 const PORT = process.env.NOTIFICATION_SERVICE_PORT || 3002;
 server.listen(PORT, () => {
     console.log(`Notification Service (including WebSocket Server) listening on port ${PORT}`);
+});
+
+// Basic Error Handling Middleware
+app.use((err, req, res, next) => {
+  logError(SERVICE_NAME, err, 'Unhandled Route Error');
+  console.error(err.stack);
+  res.status(500).send('Something broke!');
 });

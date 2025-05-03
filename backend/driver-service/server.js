@@ -5,6 +5,7 @@ const { connectRedis, getRedisClient } = require('./redisClient');
 const { connectKafkaProducer, getKafkaProducer, connectKafkaConsumer, setupDriverServiceConsumer } = require('./kafkaClient');
 const Driver = require('./models/Driver');
 const { getFetch } = require('./fetchHelper');
+const { logError } = require('../utils/logger'); // Import logger
 
 const app = express();
 app.use(express.json());
@@ -12,6 +13,7 @@ app.use(express.json());
 const MONGODB_URI = process.env.DRIVER_SERVICE_MONGODB_URI || 'mongodb://localhost:27017/driver_service';
 const RIDE_SERVICE_URL = process.env.RIDE_SERVICE_URL || 'http://localhost:3000';
 const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || 'http://localhost:3002';
+const SERVICE_NAME = 'driver-service';
 
 let isRedisConnected = false;
 let isKafkaProducerConnected = false;
@@ -20,31 +22,35 @@ let isKafkaConsumerConnected = false;
 // --- Database Connection ---
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('DriverService MongoDB connected'))
-  .catch(err => console.error('DriverService MongoDB connection error:', err));
+  .catch(err => {
+      logError(SERVICE_NAME, err, 'MongoDB Connection');
+      console.error('DriverService MongoDB connection error:', err);
+      process.exit(1); // Exit if DB fails
+  });
 
 // --- Redis Connection ---
 connectRedis().then(connected => {
     isRedisConnected = connected;
     if (connected) console.log('DriverService Redis connected');
     else console.warn('DriverService Redis connection failed. Location/Status updates might fail.');
-}).catch(err => console.error('DriverService Redis connection error:', err));
+}).catch(err => logError(SERVICE_NAME, err, 'Redis Connection'));
 
 // --- Kafka Connection ---
 connectKafkaProducer().then(connected => {
     isKafkaProducerConnected = connected;
     if(connected) console.log('DriverService Kafka Producer connected');
     else console.warn('DriverService Kafka Producer connection failed. Events will not be published.');
-}).catch(err => console.error('DriverService Kafka Producer connection error:', err));
+}).catch(err => logError(SERVICE_NAME, err, 'Kafka Producer Connection'));
 
 connectKafkaConsumer('driver-service-group').then(connected => {
     isKafkaConsumerConnected = connected;
     if (connected) {
         console.log('DriverService Kafka Consumer connected');
-        setupDriverServiceConsumer().catch(err => console.error("Error setting up DriverService consumer:", err));
+        setupDriverServiceConsumer().catch(err => logError(SERVICE_NAME, err, "Kafka Consumer Setup"));
     } else {
         console.warn('DriverService Kafka Consumer connection failed. Will not process events.');
     }
-}).catch(err => console.error('DriverService Kafka Consumer connection error:', err));
+}).catch(err => logError(SERVICE_NAME, err, 'Kafka Consumer Connection'));
 
 // --- Helper Functions ---
 
@@ -73,71 +79,55 @@ app.post('/find-drivers', async (req, res) => {
 
     const rideId = ride._id.toString();
     const [pickupLon, pickupLat] = ride.pickupLocation.geo.coordinates;
+    const requestedVehicleType = ride.preferences?.vehicleType; // Get requested vehicle type
 
-    console.log(`Finding drivers for ride ${rideId} near [${pickupLon}, ${pickupLat}]`);
+    console.log(`Finding drivers for ride ${rideId} near [${pickupLon}, ${pickupLat}]` + (requestedVehicleType ? ` (Type: ${requestedVehicleType})` : ''));
 
-    if (!isRedisConnected) {
+    const redisClient = getRedisClient(); // Get client (might be null)
+    if (!redisClient) {
          console.warn(`Redis not connected. Cannot query driver locations for ride ${rideId}.`);
-         // Optionally try DB query as fallback, but it's less efficient for real-time
+         logError(SERVICE_NAME, new Error('Redis client not available'), `find-drivers ${rideId}`);
          // await publishRideUpdate(rideId, { status: 'no_drivers_found', reason: 'Location service unavailable (Redis)' });
          return res.status(503).json({ message: 'Location service unavailable (Redis)' });
     }
 
-    const redisClient = getRedisClient();
-
     try {
-        // 1. Query Redis for nearby available drivers
-        // Using GEOSEARCH (Redis 6.2+) - replace with GEORADIUS if using older Redis
-         const searchRadiusKm = process.env.DRIVER_SEARCH_RADIUS_KM || 5; // Search within 5km
-         // GEOSEARCH driver-locations BYLONLAT pickupLon pickupLat BYRADIUS searchRadiusKm km WITHCOORD WITHDIST ASC COUNT 10
-//         const nearbyDriversResult = await redisClient.sendCommand([
-//            'GEOSEARCH',
-//            'driver-locations', // The key where driver locations are stored (needs to match Location Service)
-//            'BYLONLAT', `${pickupLon}`, `${pickupLat}`,
-//            'BYRADIUS', `${searchRadiusKm}`, 'km',
-//            'WITHCOORD', // Include coordinates
-//            'WITHDIST', // Include distance
-//            'ASC', // Order by distance ascending
-//            'COUNT', '1' // Limit initial search (can be adjusted)
-//         ]);
+        // 1. Query Redis for nearby available drivers using GEORADIUS
+         const searchRadiusKm = parseInt(process.env.DRIVER_SEARCH_RADIUS_KM || '5');
+         const driverCountLimit = 10; // Limit initial Redis query
+
+         let nearbyDriversResult;
+         try {
+              nearbyDriversResult = await redisClient.sendCommand([
+                   'GEORADIUS',
+                   'driver-locations', // Key from Location Service
+                   String(pickupLon),
+                   String(pickupLat),
+                   String(searchRadiusKm),
+                   'km',
+                   'WITHCOORD',
+                   'WITHDIST',
+                   'ASC',
+                   'COUNT',
+                   String(driverCountLimit)
+              ]);
+         } catch (redisError) {
+              // Handle specific Redis errors like WRONGTYPE
+              if (redisError.message.includes('WRONGTYPE')) {
+                  logError(SERVICE_NAME, redisError, `Redis key 'driver-locations' is not a Geo Set for ride ${rideId}`);
+                  console.error(`Redis key 'driver-locations' is not a Geo Set. Ensure Location Service is writing correctly.`);
+                  await publishRideUpdate(rideId, { status: 'no_drivers_found', reason: 'Internal location data error.' });
+                  return res.status(500).json({ message: 'Internal location data error.' });
+              }
+              // Rethrow other Redis errors
+              throw redisError;
+         }
 
 
-//// Replace the existing GEOSEARCH command with this fixed version
-//const nearby = await redisClient.geoRadius(
-//  'driver-locations',
-//  pickupLon, 
-//  pickupLat, 
-//  searchRadiusKm, 
-//  'km', 
-//  { 
-//    WITHCOORD: true, 
-//    WITHDIST: true, 
-//    COUNT: 10, 
-//    ASC: true 
-//  }
-//);
-
-
-const nearbyDriversResult = await redisClient.sendCommand([
-  'GEORADIUS',               // command
-  'driver-locations',        // key
-  String(pickupLon),         // e.g. "75.5354237"
-  String(pickupLat),         // e.g. "31.3992422"
-  String(searchRadiusKm),    // e.g. "5"
-  'km',
-  'WITHCOORD',
-  'WITHDIST',
-  'ASC',
-  'COUNT',
-  '10'
-]);
-
-         console.log(`Redis GEOSEARCH result for ride ${rideId}:`, nearbyDriversResult);
-
+         console.log(`Redis GEORADIUS result for ride ${rideId}:`, nearbyDriversResult);
 
         if (!nearbyDriversResult || nearbyDriversResult.length === 0) {
             console.log(`No drivers found within ${searchRadiusKm}km for ride ${rideId}`);
-            // Optionally publish 'no_drivers_found' status update via Kafka
             await publishRideUpdate(rideId, { status: 'no_drivers_found', reason: 'No drivers in range' });
             return res.status(404).json({ message: 'No available drivers found nearby' });
         }
@@ -146,15 +136,8 @@ const nearbyDriversResult = await redisClient.sendCommand([
          const nearbyDriverIdsWithDistance = nearbyDriversResult.map(result => ({
            driverId: result[0], // Driver ID is the member name
            distance: parseFloat(result[1]), // Distance is the second element
-             //Coordinates are in result[2] if needed: [lon, lat]
+           coordinates: result[2] // [lon, lat]
           }));
-
-
-//  const nearbyDriverIdsWithDistance = nearbyDriversResult.map(result => ({
-//            driverId: "680e91333543b569172619f9", // Driver ID is the member name
-//            distance: parseFloat("3.500"), // Distance is the second element
-//            // Coordinates are in result[2] if needed: [lon, lat]
-//         }));
 
         // 3. Fetch driver details (rating, vehicle, status) from MongoDB for the nearby IDs
         const driverIds = nearbyDriverIdsWithDistance.map(d => d.driverId);
@@ -164,48 +147,16 @@ const nearbyDriversResult = await redisClient.sendCommand([
             currentStatus: 'available' // Ensure they are actually available in DB too
         }).select('rating vehicle currentStatus'); // Select necessary fields
 
-
-
-        // 4. Quick hack: Normalize any string-encoded vehicle JSON
-//        const normalizedDrivers = driversFromDb.map(d => {
-//            if (typeof d.vehicle === 'string') {
-//                try {
-//                    return { ...d, vehicle: JSON.parse(d.vehicle) };
-//                } catch (err) {
-//                    console.warn(`Failed to parse vehicle for driver ${d._id}:`, err.message);
-//                    return null;
-//                }
-//            }
-//            return d;
-//        }).filter(Boolean);
-
-        // 5. Combine Redis data with normalized DB data and filter unavailable drivers
-//        let availableDrivers = nearbyDriverIdsWithDistance
-//            .map(redisDriver => {
-//                const dbDriver = normalizedDrivers.find(db => db._id.toString() === redisDriver.driverId);
-//                if (dbDriver) {
-//                    return {
-//                        driverId: redisDriver.driverId,
-//                        distance: redisDriver.distance,
-//                        rating: dbDriver.rating,
-//                        vehicle: dbDriver.vehicle,
-//                       status: dbDriver.currentStatus
-//                    };
-//                }
-//               return null;
-//            })
-//            .filter(driver => driver !== null);
-
-
-
-
-
-
-        // 4. Combine Redis location data with DB data and filter unavailable drivers
-        const availableDrivers = nearbyDriverIdsWithDistance
+        // 4. Combine Redis location data with DB data and filter unavailable/mismatched drivers
+        let availableDrivers = nearbyDriverIdsWithDistance
             .map(redisDriver => {
                 const dbDriver = driversFromDb.find(db => db._id.toString() === redisDriver.driverId);
                 if (dbDriver) {
+                    // Vehicle Type Filter
+                    if (requestedVehicleType && requestedVehicleType !== 'Any' && dbDriver.vehicle?.type !== requestedVehicleType) {
+                         console.log(`Driver ${redisDriver.driverId} skipped for ride ${rideId}: Vehicle type mismatch (Required: ${requestedVehicleType}, Has: ${dbDriver.vehicle?.type})`);
+                         return null; // Skip driver if vehicle type doesn't match
+                    }
                     return {
                         driverId: redisDriver.driverId,
                         distance: redisDriver.distance,
@@ -219,14 +170,10 @@ const nearbyDriversResult = await redisClient.sendCommand([
             .filter(driver => driver !== null); // Remove null entries
 
 
-
-
-
-// 6. Apply vehicleTyle filter
         if (availableDrivers.length === 0) {
-            console.log(`No *available* drivers found for ride ${rideId} after DB check.`);
-             await publishRideUpdate(rideId, { status: 'no_drivers_found', reason: 'Nearby drivers not available' });
-            return res.status(404).json({ message: 'No available drivers found nearby' });
+            console.log(`No *available* drivers found for ride ${rideId} after DB check/filtering.`);
+             await publishRideUpdate(rideId, { status: 'no_drivers_found', reason: 'Nearby drivers not available or vehicle type mismatch' });
+            return res.status(404).json({ message: 'No suitable available drivers found nearby' });
         }
 
         // 5. Implement Matching Algorithm (Simple example: sort by distance, then rating)
@@ -243,53 +190,62 @@ const nearbyDriversResult = await redisClient.sendCommand([
 
         console.log(`Created batch of ${driverBatch.length} drivers for ride ${rideId}:`, driverBatch.map(d=>d.driverId));
 
-        // 7. Store Batch in Redis with TTL (e.g., 90 seconds)
+        // 7. Store Batch in Redis with TTL
         const batchKey = `driver-batch:${rideId}`;
-        const batchTTL = parseInt(process.env.DRIVER_BATCH_TTL_SECONDS || '90');
-        await redisClient.set(batchKey, JSON.stringify({ drivers: driverBatch, rideDetails: ride }), { EX: batchTTL });
-        console.log(`Stored driver batch in Redis for ride ${rideId} with TTL ${batchTTL}s`);
+        const batchTTL = parseInt(process.env.DRIVER_BATCH_TTL_SECONDS || '60'); // Use configured TTL
+        try {
+            // Pass the original ride object along with the batch for context in Notification Service
+             await redisClient.set(batchKey, JSON.stringify({ drivers: driverBatch, rideDetails: ride }), { EX: batchTTL });
+             console.log(`Stored driver batch in Redis for ride ${rideId} with TTL ${batchTTL}s`);
+        } catch (redisError) {
+             logError(SERVICE_NAME, redisError, `Redis Set Batch Failed for ride ${rideId}`);
+             // If setting batch fails, we probably can't proceed reliably
+             return res.status(500).json({ message: 'Failed to store driver batch' });
+        }
 
 
         // 8. Publish driver-match event to Kafka (for Notification Service)
-        if (isKafkaProducerConnected) {
-            const producer = getKafkaProducer();
-            await producer.send({
-                topic: 'driver-matches',
-                messages: [{ key: rideId, value: JSON.stringify({ rideId: rideId, batch: driverBatch }) }],
-            });
-            console.log(`Published driver-match event for ride ${rideId}`);
+        const producer = getKafkaProducer();
+        if (producer) {
+            try {
+                await producer.send({
+                    topic: 'driver-matches',
+                    // Send the full ride details along with the batch
+                    messages: [{ key: rideId, value: JSON.stringify({ rideId: rideId, batch: driverBatch, rideDetails: ride }) }],
+                });
+                console.log(`Published driver-match event for ride ${rideId}`);
+            } catch (kafkaError) {
+                 logError(SERVICE_NAME, kafkaError, `Kafka Publish driver-match Failed for ${rideId}`);
+                 console.error(`Kafka Producer error. Cannot publish driver-match event for ${rideId}.`);
+                 // Should we attempt fallback notification call? Maybe not, as Kafka is critical path.
+                 return res.status(500).json({ message: 'Failed to notify matching service' });
+            }
         } else {
-            console.warn(`Kafka Producer not connected. Cannot publish driver-match event for ${rideId}. Simulating Notification Service call.`);
-            // Simulate direct call if Kafka isn't available
+            console.warn(`Kafka Producer not connected. Cannot publish driver-match event for ${rideId}.`);
+            // Fallback simulation (remove for production)
              try {
                  const fetch = await getFetch();
                  await fetch(`${NOTIFICATION_SERVICE_URL}/notify/drivers`, { // Endpoint expects batch
                      method: 'POST',
                      headers: { 'Content-Type': 'application/json' },
-                     body: JSON.stringify({ rideId: rideId, batch: driverBatch }),
+                     body: JSON.stringify({ rideId: rideId, batch: driverBatch, rideDetails: ride }),
                  });
                  console.log(`Simulated call to Notification Service for ride ${rideId}`);
              } catch (fetchError) {
-                 console.error(`Error simulating call to Notification Service for ride ${rideId}:`, fetchError.message);
+                 logError(SERVICE_NAME, fetchError, `Simulated Notification Service call failed for ride ${rideId}`);
              }
         }
 
         res.status(200).json({ message: 'Driver search initiated', batch: driverBatch });
 
     } catch (error) {
-        if (error.message.includes('GEOSEARCH requires Redis 6.2.0')) {
-             console.error("Redis version does not support GEOSEARCH. Use GEORADIUS or upgrade Redis.");
-             // Implement fallback using GEORADIUS if needed
-             res.status(501).json({ message: 'Location search feature requires Redis 6.2+' });
-         } else if (error.message.includes('WRONGTYPE')) {
-             console.error(`Redis key 'driver-locations' is not a Geo Set. Ensure Location Service is writing correctly.`);
-             res.status(500).json({ message: 'Internal location data error.' });
-         }
-         else {
-            console.error(`Error finding drivers for ride ${rideId}:`, error);
-            res.status(500).json({ message: 'Failed to find drivers' });
+        logError(SERVICE_NAME, error, `POST /find-drivers for ride ${rideId}`);
+        console.error(`Error finding drivers for ride ${rideId}:`, error);
+        // Avoid publishing update again if already done
+        if (res.statusCode < 500) { // Only publish if not already handled (e.g., Redis error)
+            publishRideUpdate(rideId, { status: 'no_drivers_found', reason: 'Internal search error' }).catch(e => logError(SERVICE_NAME, e, 'Publish Ride Update on Find Error'));
         }
-         await publishRideUpdate(rideId, { status: 'no_drivers_found', reason: 'Internal search error' });
+        res.status(500).json({ message: 'Failed to find drivers' });
     }
 });
 
@@ -302,9 +258,9 @@ app.put('/drivers/:driverId/status', async (req, res) => {
     if (!status) {
         return res.status(400).json({ message: 'Missing status' });
     }
-    const validStatuses = ['available', 'busy', 'offline', 'en_route_pickup', 'at_pickup', 'on_ride'];
+    const validStatuses = ['available', 'busy', 'offline', 'en_route_pickup', 'at_pickup', 'on_ride', 'driver_arrived']; // Added driver_arrived
      if (!validStatuses.includes(status)) {
-         return res.status(400).json({ message: 'Invalid status provided' });
+         return res.status(400).json({ message: `Invalid status provided: ${status}` });
      }
 
     console.log(`Updating status for driver ${driverId} to ${status}` + (rideId ? ` for ride ${rideId}` : ''));
@@ -318,40 +274,50 @@ app.put('/drivers/:driverId/status', async (req, res) => {
         // Update status in MongoDB
         driver.currentStatus = status;
         driver.isOnline = status !== 'offline'; // Update online status based on main status
-        if (status === 'busy' || status === 'en_route_pickup' || status === 'at_pickup' || status === 'on_ride') {
-            driver.currentRideId = rideId || driver.currentRideId; // Assign rideId if provided and status indicates being on a ride
+        // Assign rideId ONLY if transitioning to a busy state for that ride
+        const busyStates = ['busy', 'en_route_pickup', 'at_pickup', 'on_ride', 'driver_arrived'];
+        if (busyStates.includes(status) && rideId) {
+            driver.currentRideId = rideId;
         } else if (status === 'available' || status === 'offline') {
-            driver.currentRideId = null; // Clear rideId when available or offline
+            // Clear rideId only if the update is NOT related to a specific ride OR if the ride matches the one being cleared
+            if (!rideId || (rideId && driver.currentRideId === rideId)) {
+                 driver.currentRideId = null;
+            }
         }
         await driver.save();
 
-        // Update status in Redis (for quick availability checks)
-        if (isRedisConnected) {
-            const redisClient = getRedisClient();
-            const statusKey = `driver-status:${driverId}`;
-             await redisClient.set(statusKey, status); // Store simple status string
+        // Update status and location in Redis
+        const redisClient = getRedisClient();
+        if (redisClient) {
+             try {
+                 const statusKey = `driver-status:${driverId}`;
+                 await redisClient.set(statusKey, status); // Store simple status string
 
-             // Also update the Geo Set if driver goes offline/online
-             if (status === 'offline') {
-                // Remove from Geo Set if they go offline
-                await redisClient.zRem('driver-locations', driverId);
-                console.log(`Removed offline driver ${driverId} from Redis Geo Set.`);
-             } else if (driver.isOnline && driver.lastKnownLocation) {
-                // Re-add or update location if they come online and have a location
-                const [lon, lat] = driver.lastKnownLocation.coordinates;
-                 await redisClient.geoAdd('driver-locations', { longitude: lon, latitude: lat, member: driverId });
-                 console.log(`Updated online driver ${driverId} in Redis Geo Set.`);
+                 // Update Geo Set based on online status
+                 if (status === 'offline') {
+                     await redisClient.zRem('driver-locations', driverId);
+                     console.log(`Removed offline driver ${driverId} from Redis Geo Set.`);
+                 } else if (driver.isOnline && driver.lastKnownLocation?.coordinates) {
+                     const [lon, lat] = driver.lastKnownLocation.coordinates;
+                     await redisClient.geoAdd('driver-locations', { longitude: lon, latitude: lat, member: driverId });
+                    // console.log(`Updated online driver ${driverId} in Redis Geo Set.`); // Can be noisy
+                 }
+                 console.log(`Driver ${driverId} status updated to ${status} in Redis`);
+             } catch (redisError) {
+                  logError(SERVICE_NAME, redisError, `Redis Update Status/Location Failed for ${driverId}`);
+                  console.warn(`Redis not connected or SET/GEOADD failed. Cannot update status/location for driver ${driverId} in Redis.`);
              }
-
-            console.log(`Driver ${driverId} status updated to ${status} in Redis`);
         } else {
-            console.warn(`Redis not connected. Cannot update status for driver ${driverId} in Redis.`);
+            console.warn(`Redis not connected. Cannot update status/location for driver ${driverId} in Redis.`);
         }
+
+        // Publish driver status update event (optional, if other services need to react)
+        // publishDriverEvent(driverId, 'status_updated', { newStatus: status, rideId: driver.currentRideId });
 
         res.status(200).json({ message: 'Driver status updated successfully', driver });
 
     } catch (error) {
-        console.error(`Error updating status for driver ${driverId}:`, error);
+        logError(SERVICE_NAME, error, `PUT /drivers/${driverId}/status`);
         res.status(500).json({ message: 'Failed to update driver status' });
     }
 });
@@ -365,7 +331,7 @@ app.get('/drivers/:driverId', async (req, res) => {
         }
         res.json(driver);
     } catch (error) {
-        console.error('Error getting driver details:', error);
+        logError(SERVICE_NAME, error, `GET /drivers/${req.params.driverId}`);
         res.status(500).json({ message: 'Failed to get driver details' });
     }
 });
@@ -377,7 +343,10 @@ app.post('/drivers', async (req, res) => {
         await newDriver.save();
         res.status(201).json(newDriver);
     } catch (error) {
-        console.error("Error creating driver:", error);
+        logError(SERVICE_NAME, error, 'POST /drivers');
+        if (error.code === 11000) { // Duplicate key
+             return res.status(409).json({ message: "Failed to create driver: Duplicate key (email, phone, or licensePlate).", error: error.message });
+        }
         res.status(400).json({ message: "Failed to create driver", error: error.message });
     }
 });
@@ -385,9 +354,10 @@ app.post('/drivers', async (req, res) => {
 
 // --- Kafka Publishing Helper ---
 async function publishRideUpdate(rideId, updateData) {
-    if (!isKafkaProducerConnected) {
+    const producer = getKafkaProducer();
+    if (!producer) {
         console.warn(`Kafka Producer not connected. Cannot publish ride update for ${rideId}. Simulating Ride Service call.`);
-        // Simulate direct call to Ride Service for status update
+        // Fallback simulation (remove for production)
         try {
              const fetch = await getFetch();
              await fetch(`${RIDE_SERVICE_URL}/rides/${rideId}/status`, {
@@ -397,18 +367,18 @@ async function publishRideUpdate(rideId, updateData) {
              });
              console.log(`Simulated call to Ride Service for ride ${rideId} status update:`, updateData);
          } catch (fetchError) {
-             console.error(`Error simulating call to Ride Service for ride ${rideId} status update:`, fetchError.message);
+             logError(SERVICE_NAME, fetchError, `Simulated Ride Service call failed for ride ${rideId} status update`);
          }
         return;
     }
     try {
-        const producer = getKafkaProducer();
         await producer.send({
             topic: 'ride-updates', // Topic for Ride Service to consume status updates
-            messages: [{ key: rideId, value: JSON.stringify({ rideId, ...updateData }) }],
+            messages: [{ key: rideId, value: JSON.stringify({ rideId, ...updateData, timestamp: new Date().toISOString() }) }], // Add timestamp
         })
         console.log(`Published ride update event for ride ${rideId}:`, updateData);
     } catch (error) {
+        logError(SERVICE_NAME, error, `Kafka Publish ride-updates Failed for ${rideId}`);
         console.error(`Failed to publish ride update for ride ${rideId}:`, error);
     }
 }
@@ -430,3 +400,10 @@ const PORT = process.env.DRIVER_SERVICE_PORT || 3001;
 app.listen(PORT, () => {
     console.log(`Driver Service listening on port ${PORT}`);
 })
+
+// Basic Error Handling Middleware
+app.use((err, req, res, next) => {
+  logError(SERVICE_NAME, err, 'Unhandled Route Error');
+  console.error(err.stack);
+  res.status(500).send('Something broke!');
+});
